@@ -271,6 +271,36 @@ def load_data(base_path, batch_size=4, num_workers=NUM_WORKERS, test_size=0.2):
 
 
 # ### Model Definition and Training
+GREEN = '\033[92m'
+END = '\033[0m'
+RED = '\033[91m'
+PURPLE = '\033[95m'
+YELLOW = '\033[93m'
+AQUA = '\033[96m'
+
+# %%
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.best_state_dict = None
+    def __call__(self, val_loss, state_dict):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.best_state_dict = state_dict
+            self.counter = 0
+            print(GREEN)
+    def get_best_state_dict(self):
+        return self.best_state_dict
 
 # In[ ]:
 
@@ -278,32 +308,70 @@ def load_data(base_path, batch_size=4, num_workers=NUM_WORKERS, test_size=0.2):
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+ 
+class WeightedLoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super(WeightedLoss, self).__init__()
 
+    def forward(self, inputs, target):
+        ce_loss = nn.CrossEntropyLoss(reduction='none')
+        ce_loss = ce_loss(inputs, target)
+        weight = torch.ones_like(target, dtype=torch.float)
+        weight[target > 0] = 3  # Any non-background class
+        return (ce_loss * weight).mean()
 class MyModel(nn.Module):
     def __init__(self):
         super(MyModel, self).__init__()
         self.conv1 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=3, padding=1)  
+        self.batchnorm1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)  
+        self.batchnorm2 = nn.BatchNorm2d(32)
         self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(in_channels=64, out_channels=5, kernel_size=3, padding=1)
+        self.batchnorm3 = nn.BatchNorm2d(64)
+        self.conv4 = nn.Conv2d(in_channels=64, out_channels=40, kernel_size=3, padding=1)
+        self.batchnorm4 = nn.BatchNorm2d(40)
+        self.conv5 = nn.Conv2d(in_channels=40, out_channels=32, kernel_size=3, padding=1)
+        self.batchnorm5 = nn.BatchNorm2d(32)
+        self.conv6 = nn.Conv2d(in_channels=32, out_channels=16, kernel_size=3, padding=1)
+        self.batchnorm6 = nn.BatchNorm2d(16)
+        self.conv7 = nn.Conv2d(in_channels=16, out_channels=5, kernel_size=3, padding=1)
+        self.batchnorm7 = nn.BatchNorm2d(5)
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.conv4(x)  
+        x = self.batchnorm1(self.relu(self.conv1(x)))
+        x = self.batchnorm2(self.relu(self.conv2(x)))
+        x = self.batchnorm3(self.relu(self.conv3(x)))
+        x = self.batchnorm4(self.relu(self.conv4(x)))
+        x = self.batchnorm5(self.relu(self.conv5(x)))
+        x = self.batchnorm6(self.relu(self.conv6(x)))
+        x = self.batchnorm7(self.conv7(x))  
         return x
 
+def plot_loss_curves(train_losses, val_losses):
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss', color='purple')
+    plt.plot(val_losses, label='Validation Loss', color='green')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Curves')
+    plt.legend()
+    plt.grid()
+    plt.show()
 def train(model, train_loader, test_loader, optimizer, criterion, num_epochs=100):
     train_losses = []
     val_losses = []
-
+    
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4, min_lr=1e-5)
+    early_stopper = EarlyStopping(patience=20, min_delta=1e-4)
+    best_val_loss = float('inf')
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
         batch_count = 0
-        print(f"Epoch {epoch+1}/{num_epochs} - Training...")
+        #print(f"Epoch {epoch+1}/{num_epochs}  training")
         for images, labels, _ in train_loader:
             images = images.cuda() if torch.cuda.is_available() else images
             labels = labels.cuda() if torch.cuda.is_available() else labels
@@ -339,16 +407,24 @@ def train(model, train_loader, test_loader, optimizer, criterion, num_epochs=100
 
                 val_loss += loss.item()
                 val_batch_count += 1
-
+        
         avg_val_loss = val_loss / val_batch_count
+        scheduler.step(avg_val_loss)
+
         val_losses.append(avg_val_loss)
 
-        if (epoch+1) % 2 == 0:
+        early_stopper(avg_val_loss, model.state_dict())
+        if early_stopper.early_stop:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+        if True or (epoch+1) % 2 == 0:
             print(f'Epoch [{epoch+1}/{num_epochs}], '
                   f'Train Loss: {avg_train_loss:.4f}, '
-                  f'Val Loss: {avg_val_loss:.4f}')
+                  f'Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]:.6f}{END}')
+            
 
-    return train_losses, val_losses
+    plot_loss_curves(train_losses, val_losses)
+    return train_losses, val_losses, early_stopper.get_best_state_dict()
 TRAIN_PATH = "./"
 # The training set is deployed automatically in the testing machine. 
 # You notebook can access the TRAIN_PATH even if you do not mount it along with notebook.
@@ -365,18 +441,19 @@ model = MyModel()
 if torch.cuda.is_available():
     model = model.cuda()
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=0.0005) 
+criterion = WeightedLoss()
 
-train_losses, val_losses = train(
+optimizer = optim.AdamW(model.parameters(), lr=0.05)
+
+train_losses, val_losses, best_state_dict = train(
     model=model,
     train_loader=train_loader,
     test_loader=test_loader,
     optimizer=optimizer,
     criterion=criterion,
-    num_epochs=100
+    num_epochs=2000
 )
-
+model.load_state_dict(best_state_dict)  # !!!!!!!!!!
 
 # ### Generate CSV for Submission
 
@@ -501,4 +578,52 @@ print(f'{zip_filename} Created successfully!')
 from IPython import get_ipython
 get_ipython().run_line_magic('run', 'metrics.py')
 
+# # %%
+
 # %%
+for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+        batch_count = 0
+        #print(f"Epoch {epoch+1}/{num_epochs}  training")
+        for images, labels, _ in train_loader:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            batch_count += 1
+
+        avg_train_loss = epoch_loss / batch_count
+        train_losses.append(avg_train_loss)
+
+        model.eval()
+        val_loss = 0.0
+        val_batch_count = 0
+
+        with torch.no_grad():
+            for images, labels, _ in test_loader:
+                images = images.cuda() if torch.cuda.is_available() else images
+                labels = labels.cuda() if torch.cuda.is_available() else labels
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                val_batch_count += 1
+        
+        avg_val_loss = val_loss / val_batch_count
+        val_losses.append(avg_val_loss)
+
+        scheduler.step(avg_val_loss)
+        early_stopper(avg_val_loss, model.state_dict())
+        if early_stopper.early_stop:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+        if (epoch+1) % 2 == 0:
+            print(f'Epoch [{epoch+1}/{num_epochs}], '
+                  f'Train Loss: {avg_train_loss:.4f}, '
+                  f'Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]:.6f}{END}')
